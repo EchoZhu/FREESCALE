@@ -1,0 +1,663 @@
+#include <hidef.h>            /* common defines and macros */
+#include "derivative.h"      /* derivative-specific definitions */
+#include "init.h"
+#include "sci_io.h"
+#include "declare.h"
+byte picture_ok=0;
+byte hangi=1;           //hang_c的增长间隙 
+byte hang = 0,hangf =0,hangc =64;      //采集数据行变量，每场总行中断数 hangc用来与hangf作比较确定是否需要采集
+byte OneLine[line_max][row_max]={0};//存储原始图像的数组
+byte road_side[line_max][3]={0};//存储两边的赛道的数组
+byte side_lost[line_max][2]={0};//记录赛道左右边缘丢线的数组
+byte handle_picture=0;
+byte picture_handled=0;
+byte sci_flag=0;
+byte start_line_count=0;
+float k=0;
+float b=0;
+char start_line_no=0;//起始线的标志
+uint past_time=0;
+byte effect_min=0;
+byte p_interval=0;
+byte i=0;
+byte temp_dianji=0;
+char error=0;//偏差
+byte per_center=0;
+
+//电机控制参数
+uint expect_speed=speed1m;//速度的期望值
+uint present_speed=0;//当前速度值,在一个pit中断周期之内编码器输出的的脉冲个数;
+int speed_error_lastdelta=0;
+int speed_error_last=0;
+int speed_error_lastlastdelta=0;
+int speed_max=speed1m*3.0;
+int speed_min=speed1m*1.0; 
+float speed_decide_kp=1.0;
+int pwm_max=55;
+
+//舵机控制参数
+uint dj_angle=8000;
+float speed_factor=1.0;//舵机转角随速度变化的系数
+uint angle_temp=0;//用来临时存储舵机转角的变量
+uint temp=0; 
+float angle_pidd=0;//舵机控制中弯道D分量所占比重
+float angle_pidp=20;//舵机控制中弯道P分量所占比重
+float angle_kp=550;
+byte x_location=60;
+byte x_location_last=60;
+//起跑线识别相关
+byte startLineFound=0;
+  
+int speed_temp=0;//速度的临时量
+byte photo_count=0;
+byte road_wide[line_max]=
+{
+0,0,0,0,0,0,0,0,0,0,
+1,3,6,8,10,12,15,17,19,22,
+24,26,29,31,33,36,38,39,41,45,
+50,55,59,63,66,69,72,75,77,80,
+79,78,79,79,79,80,81,82,84,84,
+85,87,88,90,90,92,93,95,97,99
+};//用来存储赛道宽度的数组，以便寻单线之后对中心值进行估计，在两边都找到边缘的情况下发生更新
+/************************************************************
+**函数名:void edge_enhance();
+**返回:void
+**函数功能描述：对原始图像进行处理，进行边缘增强，与黑白二值化作用相同
+*************************************************************/
+void edge_enhance();
+/************************************************************
+**函数名:void get_center();
+**返回:void
+**函数功能描述：获取图像的中心点
+*************************************************************/
+void get_center();
+ /************************************************************
+**函数名:void angle_control();
+**返回:void
+**函数功能描述：控制舵机角度,电机速度
+*************************************************************/
+void angle_control();
+void speed_control();
+
+/************************************************************
+**函数名：void photo_out(void)
+**返回：void
+**函数功能描述：从串口输出图像
+*************************************************************/
+
+void photo_out(void) ;
+/************************************************************
+**函数名:void griddle2(void)
+**返回:
+**函数功能描述：对灰度值图像进行滤波
+*************************************************************/
+void griddle2(void);
+
+ /************************************************************
+**函数名:void make_line(void)
+**返回:void
+**函数功能描述：两次拟合，第一次拟合用来作为第二次拟合去噪点的标准
+*************************************************************/
+
+void make_line(void);
+
+ /************************************************************
+**函数名:void start_line(void)
+**返回:void
+**函数功能描述：起跑线识别
+*************************************************************/
+
+void start_line(void);
+
+
+void main(void) {
+  /* put your own code here */
+
+  //interrupt_init();
+  pll_init_80();
+  pwm_dj_init();
+  pit_init();
+  sci_init_order();  //串口初始化
+  pwm_dianji_init();
+  port_init();
+  count_init();//编码计数器初始化
+  
+  	
+  	EnableInterrupts;
+  	 while(past_time!=200) 
+  {
+  if(past_time%20==0)
+  PORTB=~PORTB;
+  }
+   PWME_PWME0=1;
+   PWME_PWME1=1; 
+   camera_get_init();
+  	PORTB=0xf0;
+  	if(PT1AD0_PT1AD05)
+  	{
+  	int speed_max=speed1m*2.0;
+  	int speed_min=speed1m*1.0;
+  	pwm_max=40;
+  	}
+  
+  	
+  for(;;) 
+  {            
+             if(picture_ok==1)//图像准备好开始做控制 
+             { 
+                     TIE_C1I=0;
+                     picture_ok=0;
+                     edge_enhance();
+                     //start_line();
+                     get_center();
+                     make_line();
+                     angle_control(); 
+                     speed_control();
+                     photo_out();
+                    //sci_write_byte(0x0c);
+                   TIE_C1I=1;                    
+               }
+                 
+    _FEED_COP(); /* feeds the dog */
+  } /* loop forever */
+  /* please make sure that you never leave main */
+}
+
+void edge_enhance()
+{
+      unsigned char Image_X,Image_Y;
+       for(Image_Y=0;Image_Y<line_max-2;Image_Y++)//双层循环对图像进行二值化处理 
+      { 
+         for(Image_X=0;Image_X<row_max-2;Image_X++)  
+        {
+            OneLine[Image_Y][Image_X] = (abs(OneLine[Image_Y][Image_X] - OneLine[Image_Y][Image_X + 2]) + abs(OneLine[Image_Y][Image_X] - OneLine[Image_Y + 2][ Image_X]))>40?0xfe:0x01;
+        }
+      }
+      
+} 
+//舵机控制函数
+void angle_control()
+{ 
+ float sum=0;
+ /*if(!PT1AD0_PT1AD05)
+ {
+ PORTB_PB5=1;
+ PWMDTY45=angle_m;
+ return;
+ } */
+  x_location=road_side[30][center];
+  dj_angle=angle_m+(60-x_location)*angle_pidp+(x_location_last-x_location)*angle_pidd+k*angle_kp;
+ x_location_last=x_location;
+ dj_angle*=speed_factor;
+ if(dj_angle<angle_l)
+ dj_angle=angle_l;
+ if(dj_angle>angle_r)
+ dj_angle=angle_r;
+ PWMDTY45=dj_angle;
+}
+//电机控制函数
+void speed_control()
+{
+int temp_speed=0;
+/*
+if(!PT1AD0_PT1AD06)
+{
+PORTB_PB6=1;
+return;
+}
+PORTB_PB6=0; */
+if(PT1AD0_PT1AD04)
+{
+PWMDTY0=35;
+return;
+}
+expect_speed=speed_max-abs(60-x_location)*(speed_max-speed_min)/60*speed_decide_p-k*k*speed_decide_kp;
+}
+void get_center()
+{
+     byte center_location=row_max>>1;
+     byte left_location=1;//查找范围的左边
+     byte right_location=row_max-3;//查找范围的右边
+     byte Image_X,Image_Y;
+     byte last_wide=0;
+     byte center2[line_max]={0};
+     word edge_sum=0;//用来记录当前点四周的点的和值
+     byte search_area_last=120;
+     byte temp_location=0;
+     byte left_lost=0;
+     byte right_lost=0;
+      for(Image_Y=line_max-2;Image_Y>1;Image_Y--)//
+      { 
+        side_lost[Image_Y][left]=1;
+        side_lost[Image_Y][right]=2;
+        //向左查找         
+         for(Image_X=center_location;Image_X>left_location;Image_X--)  
+        {
+          if(OneLine[Image_Y][Image_X]==0xfe)
+          {
+            edge_sum=OneLine[Image_Y+1][Image_X+1]+OneLine[Image_Y+1][Image_X]+OneLine[Image_Y+1][Image_X-1]+OneLine[Image_Y-1][Image_X+1]+OneLine[Image_Y-1][Image_X]+OneLine[Image_Y-1][Image_X]-1+OneLine[Image_Y][Image_X+1]+OneLine[Image_Y][Image_X-1];
+            if(edge_sum>(0xfe*edge_around)) //若当前点附近有足够的红点则说明找到了赛道边缘
+            {
+            side_lost[Image_Y][left]=0; 
+            break;           
+            }
+          }             
+        }
+        road_side[Image_Y][left]=Image_X;
+        //向右查找
+        for(Image_X=center_location;Image_X<right_location;Image_X++)  
+        {
+          if(OneLine[Image_Y][Image_X]==0xfe)
+          {
+            edge_sum=OneLine[Image_Y+1][Image_X+1]+OneLine[Image_Y+1][Image_X]+OneLine[Image_Y+1][Image_X-1]+OneLine[Image_Y-1][Image_X+1]+OneLine[Image_Y-1][Image_X]+OneLine[Image_Y-1][Image_X]-1+OneLine[Image_Y][Image_X+1]+OneLine[Image_Y][Image_X-1];
+            if(edge_sum>(0xfe*edge_around))//若当前点附近有足够的红点则说明找到了赛道边缘
+            {
+            side_lost[Image_Y][right]=0;
+            break;            
+            }
+          }             
+        }
+        //不管是不是break出来的，都需要对road_side进行赋值，若不是break出来的，赋的值为查找范围
+        road_side[Image_Y][right]=Image_X;       
+        //若左右边缘都找到，则依照误差情况进行查找范围以及查找中心的更新
+        switch(side_lost[Image_Y][left]+side_lost[Image_Y][right])
+        {
+       case 0://两边都找到，更新一些参数
+            center_location=(road_side[Image_Y][left]+road_side[Image_Y][right])>>1;
+            left_location=(road_side[Image_Y][left]-10)>2?(road_side[Image_Y][left]-10):2;  
+            right_location=(road_side[Image_Y][right]+10)<(row_max-3)?(road_side[Image_Y][right]+10):(row_max-3);
+            last_wide=road_side[Image_Y][right]-road_side[Image_Y][left];
+            search_area_last=right_location-left_location;
+            road_side[Image_Y][center]=center_location;
+            left_lost=0;
+            right_lost=0;            
+            break;
+            
+            
+        case 1://左边找不到
+        if(last_wide)
+        center_location=(road_side[Image_Y][right]-(last_wide>>1))>0?(road_side[Image_Y][right]-(last_wide>>1)):0;
+        else
+        center_location=(road_side[Image_Y][right]-(road_wide[Image_Y]>>1))>0?(road_side[Image_Y][right]-(road_wide[Image_Y]>>1)):0;
+        temp_location=(road_side[Image_Y][right]+10)<(row_max-3)?(road_side[Image_Y][right]+10):(row_max-3);
+        if(temp_location-left_location<=search_area_last)
+        {
+        right_location=temp_location;
+        search_area_last=right_location-left_location;
+        }
+        road_side[Image_Y][center]=center_location;
+        left_lost++;
+        right_lost=0;
+        if(left_lost>=5)
+        {
+        effect_min=30;
+        if(Image_Y<=30)
+        return;
+        }
+         break;
+         
+         
+        case 2://右边找不到
+        if(last_wide)
+        center_location=(road_side[Image_Y][left]+(last_wide>>1))<row_max-2?(road_side[Image_Y][left]+(last_wide>>1)):row_max-2; 
+        else
+        center_location=(road_side[Image_Y][left]+(road_wide[Image_Y]>>1))<row_max-2?(road_side[Image_Y][left]+(road_wide[Image_Y]>>1)):row_max-2; 
+         temp_location=(road_side[Image_Y][left]-10)>2?(road_side[Image_Y][left]-10):2;
+         if((right_location-temp_location)<=search_area_last)
+         {
+         left_location=temp_location;
+         search_area_last=right_location-left_location;
+         }
+        road_side[Image_Y][center]=center_location;
+        right_lost++;
+        left_lost=0;
+        if(right_lost>=5)
+       {
+        effect_min=30;
+        if(Image_Y<=30)
+        return;
+        }
+        break;
+        
+        
+        case 3://两边都找不到，对应十字路口
+          center_location=(left_location+right_location)>>1;
+          road_side[Image_Y][center]=center_location;
+          left_lost++;
+          right_lost++;
+          
+        break;         
+        }
+        OneLine[Image_Y][road_side[Image_Y][left]]=0x0a;
+        OneLine[Image_Y][road_side[Image_Y][right]]=0x0a;        
+        OneLine[Image_Y][center_location]=0x0b;
+        OneLine[Image_Y][left_location]=0x0b;
+        OneLine[Image_Y][right_location]=0x0b;
+}                            
+ //判断找到的中心点有效范围
+ for(Image_Y=40;Image_Y>2;Image_Y--)
+ { 
+     effect_min=Image_Y; 
+     if(abs(road_side[Image_Y][center]-60)>50)
+         break;
+ }
+ //OneLine[Image_Y][road_side[Image_Y][center]]=0x0a;
+
+ }
+ 
+ void photo_out(void) 
+{
+  unsigned char Image_X,Image_Y; 
+  if(!PT1AD0_PT1AD07)
+  {
+  PORTB_PB7=1;
+  PWME_PWME5=1; 
+    PWME_PWME0=1; 
+     PWME_PWME1=1; 
+  return;
+  }
+  PORTB_PB7=0;
+   PWME_PWME5=0; 
+    PWME_PWME0=0; 
+     PWME_PWME1=1; 
+  for(Image_Y=0;Image_Y<=line_max-1;Image_Y++)
+  {
+  OneLine[Image_Y][60]=0x0a;
+  } 
+  for(Image_Y=0;Image_Y<line_max;Image_Y++) 
+  { 
+         for(Image_X=0;Image_X<row_max;Image_X++)  
+        {
+            
+           switch(OneLine[Image_Y][Image_X]) 
+           {
+            case 0:
+            sci_write_byte(OneLine[Image_Y][Image_X]+1);
+            break;
+            case 255:
+            sci_write_byte(OneLine[Image_Y][Image_X]-1);
+            break;
+            default:
+            sci_write_byte(OneLine[Image_Y][Image_X]);                
+            
+           }
+        }    
+        sci_write_byte(0x00);//00表示换行     
+  } 
+  sci_write_byte(0xff);//ff表示换场
+  
+  
+}
+
+void griddle2(void)
+{
+  byte line_no=0;
+  byte row_no=0;
+ 
+  for(line_no=0;line_no<=line_max-1;line_no++)
+  {
+        for(row_no=0;row_no<=row_max-1;row_no++)
+        {
+          if(OneLine[line_no][row_no]<=20||OneLine[line_no][row_no]>=220)
+          {
+           OneLine[line_no][row_no]=OneLine[line_no][((row_no+1)==row_max-1)?(row_no-1):(row_no+1)];
+          }
+        }
+ }
+ 
+}
+
+
+#pragma CODE_SEG __NEAR_SEG NON_BANKED 
+   /************************************************************
+**函数名: void interrupt 8 pt0_get_signal(void)?
+**返回：  无
+**函数功能描述:图像捕捉行中断处理函数
+*************************************************************/
+
+void interrupt 8 line_interrupt(void)//行中断 
+{ 
+  TFLG1_C0F = 1; //清除中断标志位
+  hangf++;
+  hangi=hang/15+1;
+  if(hangf==hangc)
+  {
+    OneLine[hang][0]=PORTA;_asm();  OneLine[hang][1]=PORTA;_asm();OneLine[hang][2]=PORTA;_asm();OneLine[hang][0]=PORTA;_asm();  OneLine[hang][1]=PORTA;_asm();OneLine[hang][2]=PORTA;_asm();OneLine[hang][3]=PORTA;_asm();OneLine[hang][4]=PORTA;_asm();
+    OneLine[hang][5]=PORTA;_asm();  OneLine[hang][6]=PORTA;_asm();OneLine[hang][7]=PORTA;_asm();OneLine[hang][8]=PORTA;_asm();OneLine[hang][9]=PORTA;_asm();    
+    OneLine[hang][0]=PORTA;_asm();  OneLine[hang][1]=PORTA;_asm();OneLine[hang][2]=PORTA;_asm();OneLine[hang][3]=PORTA;_asm();OneLine[hang][4]=PORTA;_asm();
+    OneLine[hang][5]=PORTA;_asm();  OneLine[hang][6]=PORTA;_asm();OneLine[hang][7]=PORTA;_asm();OneLine[hang][8]=PORTA;_asm();OneLine[hang][9]=PORTA;_asm();
+    OneLine[hang][0]=PORTA;_asm();  OneLine[hang][1]=PORTA;_asm();OneLine[hang][2]=PORTA;_asm();
+    
+    OneLine[hang][0]=PORTA;_asm();  OneLine[hang][1]=PORTA;_asm();OneLine[hang][2]=PORTA;_asm();OneLine[hang][3]=PORTA;_asm();OneLine[hang][4]=PORTA;_asm();
+    OneLine[hang][5]=PORTA;_asm();  OneLine[hang][6]=PORTA;_asm();OneLine[hang][7]=PORTA;_asm();OneLine[hang][8]=PORTA;_asm();OneLine[hang][9]=PORTA;_asm();    
+    OneLine[hang][10]=PORTA;_asm();OneLine[hang][11]=PORTA;_asm();OneLine[hang][12]=PORTA;_asm();OneLine[hang][13]=PORTA;_asm();OneLine[hang][14]=PORTA;_asm();
+    OneLine[hang][15]=PORTA;_asm();OneLine[hang][16]=PORTA;_asm();OneLine[hang][17]=PORTA;_asm();OneLine[hang][18]=PORTA;_asm();OneLine[hang][19]=PORTA;_asm();
+    OneLine[hang][20]=PORTA;_asm();OneLine[hang][21]=PORTA;_asm();OneLine[hang][22]=PORTA;_asm();OneLine[hang][23]=PORTA;_asm();OneLine[hang][24]=PORTA;_asm();
+    OneLine[hang][25]=PORTA;_asm();OneLine[hang][26]=PORTA;_asm();OneLine[hang][27]=PORTA;_asm();OneLine[hang][28]=PORTA;_asm();OneLine[hang][29]=PORTA;_asm();
+    OneLine[hang][30]=PORTA;_asm();OneLine[hang][31]=PORTA;_asm();OneLine[hang][32]=PORTA;_asm();OneLine[hang][33]=PORTA;_asm();OneLine[hang][34]=PORTA;_asm();
+    OneLine[hang][35]=PORTA;_asm();OneLine[hang][36]=PORTA;_asm();OneLine[hang][37]=PORTA;_asm();OneLine[hang][38]=PORTA;_asm();OneLine[hang][39]=PORTA;_asm();
+    OneLine[hang][40]=PORTA;_asm();OneLine[hang][41]=PORTA;_asm();OneLine[hang][42]=PORTA;_asm();OneLine[hang][43]=PORTA;_asm();OneLine[hang][44]=PORTA;_asm();
+    OneLine[hang][45]=PORTA;_asm();OneLine[hang][46]=PORTA;_asm();OneLine[hang][47]=PORTA;_asm();OneLine[hang][48]=PORTA;_asm();OneLine[hang][49]=PORTA;_asm();
+    OneLine[hang][50]=PORTA;_asm();OneLine[hang][51]=PORTA;_asm();OneLine[hang][52]=PORTA;_asm();OneLine[hang][53]=PORTA;_asm();OneLine[hang][54]=PORTA;_asm();
+    OneLine[hang][55]=PORTA;_asm();OneLine[hang][56]=PORTA;_asm();OneLine[hang][57]=PORTA;_asm();OneLine[hang][58]=PORTA;_asm();OneLine[hang][59]=PORTA;_asm();
+    OneLine[hang][60]=PORTA;_asm();OneLine[hang][61]=PORTA;_asm();OneLine[hang][62]=PORTA;_asm();OneLine[hang][63]=PORTA;_asm();OneLine[hang][64]=PORTA;_asm();
+    OneLine[hang][65]=PORTA;_asm();OneLine[hang][66]=PORTA;_asm();OneLine[hang][67]=PORTA;_asm();OneLine[hang][68]=PORTA;_asm();OneLine[hang][69]=PORTA;_asm();
+    OneLine[hang][70]=PORTA;_asm();OneLine[hang][71]=PORTA;_asm();OneLine[hang][72]=PORTA;_asm();OneLine[hang][73]=PORTA;_asm();OneLine[hang][74]=PORTA;_asm();
+    OneLine[hang][75]=PORTA;_asm();OneLine[hang][76]=PORTA;_asm();OneLine[hang][77]=PORTA;_asm();OneLine[hang][78]=PORTA;_asm();OneLine[hang][79]=PORTA;_asm();
+    OneLine[hang][80]=PORTA;_asm();OneLine[hang][81]=PORTA;_asm();OneLine[hang][82]=PORTA;_asm();OneLine[hang][83]=PORTA;_asm();OneLine[hang][84]=PORTA;_asm();
+    OneLine[hang][85]=PORTA;_asm();OneLine[hang][86]=PORTA;_asm();OneLine[hang][87]=PORTA;_asm();OneLine[hang][88]=PORTA;_asm();OneLine[hang][89]=PORTA;_asm();
+    OneLine[hang][90]=PORTA;_asm();OneLine[hang][91]=PORTA;_asm();OneLine[hang][92]=PORTA;_asm();OneLine[hang][93]=PORTA;_asm();OneLine[hang][94]=PORTA;_asm();
+    OneLine[hang][95]=PORTA;_asm();OneLine[hang][96]=PORTA;_asm();OneLine[hang][97]=PORTA;_asm();OneLine[hang][98]=PORTA;_asm();OneLine[hang][99]=PORTA;_asm();
+    OneLine[hang][100]=PORTA;_asm();OneLine[hang][101]=PORTA;_asm();OneLine[hang][102]=PORTA;_asm();OneLine[hang][103]=PORTA;_asm();OneLine[hang][104]=PORTA;_asm();
+    OneLine[hang][105]=PORTA;_asm();OneLine[hang][106]=PORTA;_asm();OneLine[hang][107]=PORTA;_asm();OneLine[hang][108]=PORTA;_asm();OneLine[hang][109]=PORTA;_asm();
+    OneLine[hang][110]=PORTA;_asm();OneLine[hang][111]=PORTA;_asm();OneLine[hang][112]=PORTA;_asm();OneLine[hang][113]=PORTA;_asm();OneLine[hang][114]=PORTA;_asm();
+    OneLine[hang][115]=PORTA;_asm();OneLine[hang][116]=PORTA;_asm();OneLine[hang][117]=PORTA;_asm();OneLine[hang][118]=PORTA;_asm();OneLine[hang][119]=PORTA;_asm();
+    hang++;
+    hangc=hangc+hangi;       
+  }
+  
+  if(hangf>=235) 
+  {      
+   TIE_C0I = 0;               //关行中断
+   TIE_C1I=0;//关场中断
+   picture_ok=1;  			           
+  }
+}
+/************************************************************
+**函数名:void interrupt 9 pt1_get_signal(void)?
+**返回：无
+**函数功能描述：图像中断处理函数?
+*************************************************************/
+
+void interrupt 9 PT5_Capture(void)//场中断
+{ 
+ DisableInterrupts;
+ TFLG1_C1F = 1; //清中断标志位                
+ hangf = 0;                       //行标识符清0
+ hang=0;
+ hangc=60;
+ hangi=1;                          //实际保留的行数清0
+ TIE_C0I = 1;       //开行中断
+ handle_picture=0;
+ EnableInterrupts;			           //开中断
+}
+/************************************************************
+**函数名:void interrupt 66 pit0_intr(void)
+**返回：无
+**函数功能描述：pit中断处理函数
+*************************************************************/
+void interrupt 66 pit0_intr(void)
+{
+ extern uint past_time;
+ 
+ int speed_error_this=0;
+ int pwm_add_value=0;
+ int pwm_temp=0;
+ int p_out=0;
+ int d_out=0;
+ int i_out=0;
+ past_time++;EnableInterrupts;
+ PITTF=0X01;//清除pit0通道的中断标志位
+ present_speed=PACNT;
+ PACNT=0;
+  if(PT1AD0_PT1AD04)
+ {
+ PORTB_PB4=1;;
+ return;
+ }
+  PORTB_PB4=0;
+ speed_error_this=expect_speed-present_speed;
+ //sci_write_byte((present_speed&0xff00)>>8);
+ //sci_write_byte(present_speed&0xff);
+   //调节开始
+  p_out=(speed_error_this-speed_error_last)*speed_kp;
+  i_out=speed_error_this*speed_ki;
+  d_out=(speed_error_lastdelta-speed_error_lastlastdelta)*speed_kd;
+  //sci_write_byte(0xff);
+   //sci_write_byte(expect_speed);
+  //sci_write_byte(present_speed);
+  //sci_write_byte(i_out);
+   pwm_add_value=p_out+i_out+d_out;
+   speed_error_lastlastdelta=speed_error_lastdelta;
+   speed_error_lastdelta=speed_error_this-speed_error_last;
+   speed_error_last=speed_error_this;
+   pwm_temp=PWMDTY0+pwm_add_value;
+   if(pwm_temp<0)
+   PWMDTY0=0;
+   if(pwm_temp>pwm_max)
+   PWMDTY0=pwm_max;
+   else
+   PWMDTY0=pwm_temp;   
+   //调节结束 
+}
+/************************************************************
+**函数名： void interrupt 21 sci1_gt_order(void)?
+**返回：无
+**函数功能描述：从串口接收命令并处理命令的中断处理函数
+*************************************************************/
+ void interrupt 21 sci1_gt_order(void)
+ { 
+   char z1;
+   z1=sci_read();
+   
+   
+   //speed_decide_d=z1/10;
+   sci_write_char("speed_d = ");
+   if((z1>>4)<10)
+   sci_write_byte((z1>>4)+0x30);
+   else
+   sci_write_byte((z1>>4)+0x37);
+   if((z1&0x0F)<10)
+   sci_write_byte((z1&0x0F)+0x30);
+   else
+   sci_write_byte((z1&0x0F)+0x37);
+   sci_write_enter();
+ } 
+ #pragma CODE_SEG DEFAULT
+ 
+ 
+ /************************************************************
+**函数名:void make_line(void)
+**返回:void
+**函数功能描述：两次拟合，第一次拟合用来作为第二次拟合去噪点的标准
+*************************************************************/
+
+void make_line(void)
+{
+byte i=0;
+float x_ba=0,y_ba=0;
+float sum_xx=0,sum_xy=0,sum_x=0,sum_y=0;
+float temp_k=0,temp_b=0;
+byte count_line=0;
+for(i=effect_min;i<=line_max-2;i++)//由于x轴每一行对应一个样本点，所以直接进行累加可得到y的总和
+{
+sum_y+=road_side[i][center];
+sum_x+=i;
+sum_xx+=i*i;
+sum_xy+=i*road_side[i][center];
+count_line++;
+}
+x_ba=sum_x/count_line;
+y_ba=sum_y/count_line;
+sum_xy=sum_xy-count_line*x_ba*y_ba;
+sum_xx=sum_xx-count_line*x_ba*x_ba;
+temp_k=(sum_xy/sum_xx);
+k=temp_k;
+temp_b=y_ba-temp_k*x_ba;
+for(i=line_max-2;i>=0;i--)
+{
+road_side[i][center]=temp_k*i+temp_b;
+if(road_side[i][center]<10||road_side[i][center]>110)
+{
+effect_min=i;
+for(i=1;i<row_max-3;i++)
+{
+OneLine[effect_min][i]=0x0a;
+}
+return;
+}
+OneLine[i][road_side[i][center]]=0x0a;
+}
+}
+
+ /************************************************************
+**函数名:void start_line(void)
+**返回:void
+**函数功能描述：起跑线识别
+*************************************************************/
+
+void start_line(void)
+{
+byte Imagex=0;
+byte Imagey=0;
+byte lineWide=0;
+byte two_part=0;
+byte line_count=0;
+ for(Imagey=line_max-2,lineWide=0,two_part=0;Imagey>=40;Imagey--)
+{
+  OneLine[Imagey][20]=0x0a;
+  OneLine[Imagey][100]=0x0a;
+  for(Imagex=20;Imagex<=100;Imagex++)
+  {
+       while(OneLine[Imagey][Imagex]==0xfe)
+      {
+      lineWide++;Imagex++;
+      }
+      if(lineWide>=15)
+      {
+        two_part++;        
+      } 
+      lineWide=0;
+  }
+  if(two_part==2)
+  {
+    line_count++;
+    if(line_count==2)
+    {
+    startLineFound=1;
+    PORTB_PB0=0;
+    PORTB_PB1=0;
+    PORTB_PB2=0;
+    PORTB_PB3=0;
+    return;
+    }    
+  } 
+  else
+  {
+  line_count=0;
+  }                      
+  }
+   PORTB_PB0=1;
+    PORTB_PB1=1;
+    PORTB_PB2=1;
+    PORTB_PB3=1;
+}
+
+ 
+ 
+
+
+ 
+
+
+  
